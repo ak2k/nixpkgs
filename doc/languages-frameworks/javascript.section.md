@@ -391,6 +391,15 @@ In case you are patching `package.json` or `pnpm-lock.yaml`, make sure to pass `
 
 If needed, set `dontPnpmConfigure = true;` to fully disable `pnpmConfigHook` without removing it from inputs manually.
 
+`pnpmConfigHook` also strips pnpm's install state — any file named `.modules.yaml` or `.pnpm-workspace-state-v1.json`, at any depth in any output, since a package can install `node_modules` as the output root — after `fixupPhase` and again after `installCheckPhase`.
+Those files describe a mutable `node_modules` and embed the per-build pnpm store path and a wall-clock timestamp, so leaving them in an output makes it unreproducible.
+Packages no longer need to delete them after their own `pnpm prune`.
+A deletion before `pnpm prune` still matters, since pnpm reads `.modules.yaml` to decide how to prune.
+Set `dontPnpmStripInstallState = true;` to keep them, or `dontPnpmConfigure = true;`, which disables this along with the rest of the hook.
+
+An output that launches through `pnpm` at runtime must disable dependency verification, since `pnpm` 11 defaults to installing when that check fails and the output's `node_modules` is in the read-only Nix store.
+Pass `--config.verify-deps-before-run=false` to the wrapped binary, as `misskey` does.
+
 #### Dealing with `sourceRoot` {#javascript-pnpm-sourceRoot}
 
 If the pnpm project is in a subdirectory, you can define `sourceRoot` or `setSourceRoot` for `fetchPnpmDeps`.
