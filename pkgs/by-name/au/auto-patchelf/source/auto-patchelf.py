@@ -144,31 +144,72 @@ def osabi_are_compatible(wanted: str, got: str) -> bool:
 
 def glob(path: Path, pattern: str, recursive: bool) -> Iterator[Path]:
     if path.is_dir():
-        return path.rglob(pattern) if recursive else path.glob(pattern)
+        # Sorted, because this order decides linkage. populate_cache() keeps
+        # every provider it finds for a given (soname, arch) and
+        # find_dependency() takes the first compatible one, so when two
+        # directories in the same search scope export the same soname, raw
+        # readdir order picks the winner -- and it differs between builds of
+        # the same derivation. The BFS worklist grows in this order too.
+        #
+        # Depth leads because a nested copy should not outrank the library a
+        # tree publishes at its top level: lib/gcc/x86_64-linux-gnu/libstdc++.so.6
+        # sorts before lib/libstdc++.so.6 on bytes alone ('g' precedes 'l'),
+        # which would bind consumers to a toolchain-internal copy.
+        #
+        # The whole path breaks ties at equal depth, rather than Path's own
+        # ordering, which compares the parts tuple component-wise: for siblings
+        # that differ where one has a path separator and the other does not --
+        # foo/lib against foo-bar/lib -- component-wise puts foo first while
+        # byte order puts foo-bar first, because '-' precedes '/'.
+        return iter(sorted(
+            path.rglob(pattern) if recursive else path.glob(pattern),
+            key=lambda p: (len(p.parts), p.as_posix()),
+        ))
     else:
         # path.glob won't return anything if the path is not a directory.
         # We extend that behavior by matching the file name against the pattern.
         # This allows to pass single files instead of dirs to auto_patchelf,
         # for greater control on the files to consider.
-        return [path] if path.match(pattern) else []
+        return iter([path] if path.match(pattern) else [])
 
 
 cached_paths: set[Path] = set()
+recursed_paths: set[Path] = set()
 soname_cache: DefaultDict[tuple[str, str], list[tuple[Path, str]]] = defaultdict(list)
 
 
-def populate_cache(initial: list[Path], recursive: bool =False) -> None:
+def populate_cache(initial: list[tuple[Path, bool]],
+                   rpath_recursive: Optional[bool] = None) -> None:
+    """Index libraries. Each entry pairs a path with how deeply to scan it.
+
+    rpath_recursive sets how directories reached through an RPATH are queued;
+    unset means "as the entry that led to them".
+    """
     lib_dirs = list(initial)
 
     while lib_dirs:
-        lib_dir = lib_dirs.pop(0)
+        lib_dir, lib_recursive = lib_dirs.pop(0)
 
-        if lib_dir in cached_paths:
+        # A recursive scan subsumes a shallow one, but not the reverse. A
+        # directory already scanned shallowly as a build input has to stay
+        # eligible for a later recursive scan, or nothing nested under it is
+        # ever indexed and its consumers fail to resolve. Rescanning appends
+        # the shallow entries to soname_cache a second time, which is harmless:
+        # find_dependency takes the first match, and those were appended first.
+        if lib_recursive:
+            if lib_dir in recursed_paths:
+                continue
+            recursed_paths.add(lib_dir)
+        elif lib_dir in cached_paths:
             continue
 
         cached_paths.add(lib_dir)
 
-        for path in glob(lib_dir, "*.so*", recursive):
+        queued_recursive = (
+            lib_recursive if rpath_recursive is None else rpath_recursive
+        )
+
+        for path in glob(lib_dir, "*.so*", lib_recursive):
             if not path.is_file():
                 continue
 
@@ -190,7 +231,7 @@ def populate_cache(initial: list[Path], recursive: bool =False) -> None:
                     arch = get_arch(elf)
                     rpath = [Path(p) for p in get_rpath(elf)
                                      if p and '$ORIGIN' not in p]
-                    lib_dirs += rpath
+                    lib_dirs += [(p, queued_recursive) for p in rpath]
                     soname_cache[(path.name, arch)].append((resolved.parent, osabi))
 
             except ELFError:
@@ -459,6 +500,7 @@ def auto_patchelf(
         keep_libc: bool = False,
         preserve_origin: bool = False,
         add_existing: bool = True,
+        search_paths: list[list[str]] = [],
         extra_args: list[str] = []) -> None:
 
     if not paths_to_patch:
@@ -467,9 +509,21 @@ def auto_patchelf(
     # Add all shared objects of the current output path to the cache,
     # before lib_dirs, so that they are chosen first in find_dependency.
     if add_existing:
-        populate_cache(paths_to_patch, recursive)
+        populate_cache([(p, recursive) for p in paths_to_patch])
 
-    populate_cache(lib_dirs)
+    # Everything registered directly goes in one pass, so that all of it is
+    # indexed before any directory reached through an RPATH. That keeps an
+    # explicitly registered search path ahead of some build input's transitive
+    # dependency; splitting the pass would let the first half's transitives jump
+    # the second half's direct registrations. Build inputs lead, then search
+    # paths in registration order. RPATH entries are queued shallow, because
+    # extending a caller's recursion to whatever its libraries point at is not
+    # what --libs does.
+    populate_cache(
+        [(p, False) for p in lib_dirs]
+        + [(Path(path), mode == "recursive") for mode, path in search_paths],
+        rpath_recursive=False,
+    )
 
     dependencies = []
     for path in chain.from_iterable(glob(p, '*', recursive) for p in paths_to_patch):
@@ -534,6 +588,17 @@ def main() -> None:
              " Directories are not searched recursively."
     )
     parser.add_argument(
+        "--search-path",
+        dest="search_paths",
+        action="append",
+        nargs=2,
+        metavar=("MODE", "PATH"),
+        default=[],
+        help="Additional search path, as MODE PATH where MODE is 'recursive'"
+             " or 'shallow'. Repeatable; occurrences are indexed in the order"
+             " given, after --libs."
+    )
+    parser.add_argument(
         "--runtime-dependencies",
         nargs="*",
         type=Path,
@@ -583,6 +648,16 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    for mode, path in args.search_paths:
+        if mode not in ("recursive", "shallow"):
+            parser.error(
+                f"--search-path: mode must be 'recursive' or 'shallow', not {mode!r}")
+        # Path("") is Path("."), so an empty argument would quietly index the
+        # working directory instead of the caller's intended tree.
+        if not path:
+            parser.error(f"--search-path {mode}: path is empty")
+
     logger = Logger(structured=args.structured_logs)
     logger.debug("automatically fixing dependencies for ELF files")
     logger.debug(pprint.pformat(vars(args)))
@@ -598,6 +673,7 @@ def main() -> None:
         keep_libc=args.keep_libc,
         preserve_origin=args.preserve_origin,
         add_existing=args.add_existing,
+        search_paths=args.search_paths,
         extra_args=args.extra_args)
 
 
