@@ -121,3 +121,50 @@ pnpmConfigHook() {
 if [ -z "${dontPnpmConfigure-}" ]; then
   postConfigureHooks+=(pnpmConfigHook)
 fi
+
+# pnpm records install state for a *mutable* node_modules. .modules.yaml keeps
+# the store-dir the tree was installed from -- which pnpmConfigHook creates with
+# mktemp, so it is a fresh path every build -- plus a wall-clock prune
+# timestamp, and .pnpm-workspace-state-v1.json is the same bookkeeping for
+# workspaces. Neither is derivable from the derivation inputs, so an output
+# carrying them differs between builds of one .drv. Removing them is what pnpm
+# itself does when it vendors a node_modules tree, and a missing manifest reads
+# back as "unmanaged tree" rather than an error. node_modules/.pnpm is not
+# install state and must stay: the sibling symlinks point into it.
+#
+# postFixup rather than fixupOutput, because pnpm regenerates the manifest from
+# whichever phase last touched node_modules -- `pnpm prune` in a package's
+# installPhase rewrites it. $prefix is only set while fixupOutput runs, hence
+# the explicit walk over the outputs.
+pnpmStripInstallState() {
+    local output
+    for output in $(getAllOutputNames); do
+        [ -e "${!output}" ] || continue
+        # Matched by name anywhere in the output, not under a */node_modules/
+        # path: a package can install the tree so that the output root *is*
+        # node_modules -- discourse does `mv node_modules $node_modules` -- and
+        # then the store path component is "...-node_modules" and no
+        # /node_modules/ component exists to anchor on. Anchoring on
+        # "${!output}" is not a substitute, since a store path can contain
+        # fnmatch metacharacters. Both names are pnpm's own, which is what
+        # makes a bare name match safe here.
+        find "${!output}" \
+            \( -name .modules.yaml -o -name .pnpm-workspace-state-v1.json \) \
+            -delete
+    done
+}
+
+# dontPnpmConfigure is documented as fully disabling pnpmConfigHook, so it has
+# to disable this half too -- a derivation that opts out is not necessarily one
+# where deleting files is safe. netbird sets it on its goModules, which is
+# fixed-output: a deletion there would change content the declared hash covers.
+# dontPnpmStripInstallState opts out of only the strip.
+if [ -z "${dontPnpmConfigure-}" ] && [ -z "${dontPnpmStripInstallState-}" ]; then
+  postFixupHooks+=(pnpmStripInstallState)
+  # installCheckPhase runs after fixupPhase, and a pnpm invocation there
+  # regenerates .pnpm-workspace-state-v1.json behind the strip. Sweep again
+  # afterwards; find is idempotent, so a second pass costs a walk and nothing
+  # else. A package whose custom installCheckPhase never reaches runHook
+  # postInstallCheck keeps whatever pnpm wrote there.
+  postInstallCheckHooks+=(pnpmStripInstallState)
+fi
