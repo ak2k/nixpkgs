@@ -144,7 +144,8 @@ def osabi_are_compatible(wanted: str, got: str) -> bool:
 
 def glob(path: Path, pattern: str, recursive: bool) -> Iterator[Path]:
     if path.is_dir():
-        return path.rglob(pattern) if recursive else path.glob(pattern)
+        # Sort: readdir order is not reproducible and the first provider wins.
+        return iter(sorted(path.rglob(pattern) if recursive else path.glob(pattern)))
     else:
         # path.glob won't return anything if the path is not a directory.
         # We extend that behavior by matching the file name against the pattern.
